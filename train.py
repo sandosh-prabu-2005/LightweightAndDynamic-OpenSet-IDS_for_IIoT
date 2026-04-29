@@ -23,7 +23,6 @@ import seaborn as sns
 
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.preprocessing import LabelEncoder
@@ -31,8 +30,8 @@ from sklearn.metrics import classification_report, confusion_matrix
 from tqdm import tqdm
 
 # Import custom modules
-from model import VAEWithTeacher, StudentNet, total_vae_loss
-from optimizer import ABAO_V2, ABAOPlus
+from model import VAEWithTeacher, StudentNet
+from optimizer import ABAO_V2
 from utils import (
     set_seed, safe_load, preprocess, balance_data, select_features_mi,
     create_open_set_split, detect_unknown_evt, extract_latent_z,
@@ -98,15 +97,52 @@ DS_CONFIG = {
 BATCH_SIZE = 512
 LR = 3e-4
 RF_THRESHOLD = 0.70
+WEIGHT_DECAY = 1e-4
+NUM_WORKERS = 4
+PIN_MEMORY = True
 
 # Device setup
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f'🖥️  Device: {DEVICE}')
+torch.backends.cudnn.benchmark = True
+
+print(f'🖥️ Device: {DEVICE}')
 if DEVICE.type == 'cuda':
-    print(f'   GPU: {torch.cuda.get_device_name(0)}')
-    print(f'   VRAM: {torch.cuda.get_device_properties(0).total_memory/1e9:.2f} GB')
+    print(f'🚀 GPU: {torch.cuda.get_device_name(0)}')
+    torch.cuda.empty_cache()
 
 set_seed(SEED)
+
+
+def vae_loss_components(model, xb, yb, beta):
+    """Compute VAE losses as GPU tensors for custom optimizer support."""
+    recon, mu, logvar, logits = model(xb)
+    loss_rec = F.mse_loss(recon, xb, reduction='mean')
+    loss_kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+    loss_cls = F.cross_entropy(logits, yb)
+    recon_error = F.mse_loss(recon, xb, reduction='none').mean(dim=1)
+    loss = loss_rec + beta * loss_kl + loss_cls
+    return loss, loss_rec, loss_kl, loss_cls, recon_error, mu, logits
+
+
+def step_abao_v2_optimizer(optimizer, loss, loss_rec, loss_cls, logits,
+                           grad_clip=1.0):
+    """Step ABAO-V2 with its classification, reconstruction, and confidence signals."""
+    optimizer.zero_grad()
+    loss.backward()
+
+    torch.nn.utils.clip_grad_norm_(
+        [p for group in optimizer.param_groups for p in group['params']],
+        max_norm=grad_clip
+    )
+
+    confidence = logits.detach().max(dim=1).values.mean().item()
+    optimizer.step(
+        loss_cls=loss_cls.detach().item(),
+        loss_rec=loss_rec.detach().item(),
+        conf=confidence
+    )
+
+    return loss.detach().item()
 
 # ============================================================================
 # Stage 1: Train VAE + Teacher Classifier
@@ -115,7 +151,8 @@ set_seed(SEED)
 def train_stage1(X_train, y_train, n_classes,
                  epochs=100, batch_size=512, lr=1e-3,
                  latent_dim=32, beta_kl=1.0, verbose_every=10,
-                 spike_factor=5.0, patience=10, grad_clip=1.0):
+                 spike_factor=5.0, patience=10, grad_clip=1.0,
+                 weight_decay=WEIGHT_DECAY):
     """
     Train VAE + Teacher Classifier with divergence detection.
     
@@ -136,17 +173,26 @@ def train_stage1(X_train, y_train, n_classes,
     Returns:
         (trained_model, history)
     """
+    if DEVICE.type == 'cuda':
+        torch.cuda.empty_cache()
+
     print(f'\n🚀 Stage 1: Training VAE + Teacher')
     print(f'   Latent dim: {latent_dim}, Epochs: {epochs}, β-KL: {beta_kl}')
     
     input_dim = X_train.shape[1]
     model = VAEWithTeacher(input_dim, latent_dim, n_classes).to(DEVICE)
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    optimizer = ABAO_V2(model.parameters(), lr=lr, weight_decay=weight_decay)
+    print('⚙️ Using Optimizer: ABAO-V2')
     
     X_t = torch.tensor(X_train, dtype=torch.float32)
     y_t = torch.tensor(y_train, dtype=torch.long)
-    loader = DataLoader(TensorDataset(X_t, y_t),
-                       batch_size=batch_size, shuffle=True)
+    loader = DataLoader(
+        TensorDataset(X_t, y_t),
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        pin_memory=PIN_MEMORY
+    )
     
     history = []
     best_loss = math.inf
@@ -160,24 +206,34 @@ def train_stage1(X_train, y_train, n_classes,
         correct = total = 0
         
         for xb, yb in loader:
-            xb, yb = xb.to(DEVICE), yb.to(DEVICE)
-            recon, mu, logvar, logits = model(xb)
+            xb = xb.to(DEVICE, non_blocking=DEVICE.type == 'cuda')
+            yb = yb.to(DEVICE, non_blocking=DEVICE.type == 'cuda')
             
             # KL warmup: linear ramp over first 40 epochs
             beta = beta_kl * min(1.0, epoch / 40)
-            loss, Lr, LKL, Lc = total_vae_loss(
-                recon, xb, mu, logvar, logits, yb, beta)
+            loss, loss_rec, loss_kl, loss_cls, recon_error, z, logits = vae_loss_components(
+                model, xb, yb, beta)
+
+            if not torch.isfinite(loss):
+                print(f'\n  ⛔ DIVERGENCE at epoch {epoch}: NaN/Inf')
+                if best_state:
+                    model.load_state_dict(best_state)
+                return model, history
             
-            optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-            optimizer.step()
+            batch_loss = step_abao_v2_optimizer(
+                optimizer,
+                loss,
+                loss_rec,
+                loss_cls,
+                logits,
+                grad_clip=grad_clip
+            )
             
             n = len(xb)
-            sum_loss += loss.item() * n
-            sum_Lr += Lr * n
-            sum_LKL += LKL * n
-            sum_Lc += Lc * n
+            sum_loss += batch_loss * n
+            sum_Lr += loss_rec.detach().item() * n
+            sum_LKL += loss_kl.detach().item() * n
+            sum_Lc += loss_cls.detach().item() * n
             correct += (logits.argmax(1) == yb).sum().item()
             total += n
         
@@ -306,6 +362,9 @@ def stage3_knowledge_distillation(model, X_train, y_train, X_detected_unknown,
         Trained student network
     """
     print(f'\n📚 Stage 3: Knowledge Distillation ({kd_epochs} epochs)')
+
+    if DEVICE.type == 'cuda':
+        torch.cuda.empty_cache()
     
     model.eval()
     
@@ -320,19 +379,20 @@ def stage3_knowledge_distillation(model, X_train, y_train, X_detected_unknown,
     y_upd_enc = le_student.fit_transform(y_upd)
     
     # Extract latent codes
-    X_upd_tensor = torch.tensor(X_upd, dtype=torch.float32).to(DEVICE)
     z = extract_latent_z(model.encoder, X_upd, device=DEVICE)
     
     # Create student network
     student = StudentNet(z.shape[1], len(le_student.classes_)).to(DEVICE)
-    optimizer = optim.Adam(student.parameters(), lr=1e-3)
+    print(f'\n🚀 Training using ABAO-V2 optimizer')
+    optimizer = ABAO_V2(student.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    print(f'⚙️ Using Optimizer: ABAO-V2 (Stage 3)')
     
     ce_loss_fn = nn.CrossEntropyLoss()
     kd_loss_fn = nn.KLDivLoss(reduction='batchmean')
     
     y_upd_tensor = torch.tensor(y_upd_enc, dtype=torch.long).to(DEVICE)
     new_unk_enc = int(le_student.transform(['new_unknown'])[0])
-    known_mask = (y_upd_enc != new_unk_enc)
+    known_mask = y_upd_tensor != new_unk_enc
     known_student_indices = torch.tensor(
         le_student.transform(np.unique(y_train)),
         dtype=torch.long,
@@ -348,7 +408,8 @@ def stage3_knowledge_distillation(model, X_train, y_train, X_detected_unknown,
         loss_ce = ce_loss_fn(student_logits, y_upd_tensor)
         
         if known_mask.sum() > 0:
-            teacher_logits = model.classifier(z[known_mask])
+            with torch.no_grad():
+                teacher_logits = model.classifier(z[known_mask])
             student_known = student_logits[known_mask][:, known_student_indices]
 
             min_classes = min(student_known.size(1), teacher_logits.size(1))
@@ -362,10 +423,15 @@ def stage3_knowledge_distillation(model, X_train, y_train, X_detected_unknown,
             loss_kd = torch.tensor(0.0, device=DEVICE)
         
         loss = 0.7 * loss_kd + 0.3 * loss_ce
+        confidence = student_logits.detach().max(dim=1).values.mean().item()
         
         optimizer.zero_grad()
         loss.backward()
-        optimizer.step()
+        optimizer.step(
+            loss_cls=loss_ce.detach().item(),
+            loss_rec=loss_kd.detach().item(),
+            conf=confidence
+        )
         
         if ep % 10 == 0:
             print(f'  KD Epoch {ep}/{kd_epochs} | Loss={loss:.4f}')
@@ -430,9 +496,13 @@ def main():
     
     # Process each dataset
     for ds_name, (X, y, scaler) in datasets.items():
+        if DEVICE.type == 'cuda':
+            torch.cuda.empty_cache()
+
         print(f'\n{"#"*70}')
         print(f'  ► Dataset: {ds_name}')
         print(f'{"#"*70}')
+        print('\n🚀 Training using ABAO-V2 optimizer')
         
         cfg = DS_CONFIG.get(ds_name, {})
         latent_dim = cfg.get('latent_dim', 32)
@@ -468,7 +538,8 @@ def main():
         teacher, hist1 = train_stage1(
             X_tr, y_tr_enc, n_cls,
             epochs=epochs, batch_size=BATCH_SIZE,
-            lr=ds_lr, latent_dim=latent_dim, beta_kl=beta_kl
+            lr=ds_lr, latent_dim=latent_dim, beta_kl=beta_kl,
+            weight_decay=WEIGHT_DECAY
         )
         res['teacher'] = teacher
         res['history1'] = hist1

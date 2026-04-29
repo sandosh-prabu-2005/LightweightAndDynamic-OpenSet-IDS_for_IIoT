@@ -6,6 +6,9 @@ import random
 import warnings
 from dataclasses import dataclass
 
+# NOTE: Final training uses ABAO-V2 based on multi-dataset evaluation.
+# This script is experimental and kept for research-only optimizer comparisons.
+
 import matplotlib
 
 matplotlib.use("Agg")
