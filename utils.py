@@ -16,18 +16,27 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from scipy.stats import genpareto
+from dataclasses import dataclass
 
 from sklearn.preprocessing import LabelEncoder, StandardScaler, MinMaxScaler
-from sklearn.feature_selection import SelectKBest, mutual_info_classif
+from sklearn.feature_selection import mutual_info_classif
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, classification_report
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.utils.class_weight import compute_class_weight
 from imblearn.over_sampling import SMOTE
 from imblearn.under_sampling import RandomUnderSampler
 from collections import Counter
 
 SEED = 42
 LABEL_UNKNOWN = 'Unknown'
+
+DATASET_FEATURE_COUNTS = {
+    'NSL-KDD': 30,
+    'CICIDS2017': 40,
+    'Gas Pipeline': 25,
+    'Water Storage': None,
+}
 
 
 def set_seed(seed=SEED):
@@ -49,7 +58,7 @@ def safe_load(path, name):
     return df
 
 
-def preprocess(df, label_col, dataset_name='', verbose=True):
+def preprocess(df, label_col, dataset_name='', verbose=True, scale=True):
     """
     Preprocess dataset: clean, encode, and scale.
     
@@ -58,6 +67,8 @@ def preprocess(df, label_col, dataset_name='', verbose=True):
         label_col: Column name for labels
         dataset_name: Name for logging
         verbose: Print progress
+        scale: Whether to fit StandardScaler immediately. For research
+            train/test pipelines, pass False and fit scaling on training data.
     
     Returns:
         (X, y, scaler): Features, labels, fitted scaler
@@ -67,11 +78,19 @@ def preprocess(df, label_col, dataset_name='', verbose=True):
     
     df = df.copy()
     df.columns = df.columns.str.strip()
+    df = df.replace([np.inf, -np.inf], np.nan)
     before = len(df)
-    df = df.drop_duplicates().fillna(0)
+    keep_duplicates = dataset_name.strip().lower() == 'water storage'
+    if keep_duplicates:
+        df = df.fillna(0)
+    else:
+        df = df.drop_duplicates().fillna(0)
     
     if verbose:
-        print(f'  Shape after clean: {df.shape}  (removed {before-len(df)} rows)')
+        if keep_duplicates:
+            print(f'  Shape after clean: {df.shape}  (duplicates kept for Water Storage)')
+        else:
+            print(f'  Shape after clean: {df.shape}  (removed {before-len(df)} rows)')
     
     if label_col not in df.columns:
         raise ValueError(f"Label column '{label_col}' not found")
@@ -88,8 +107,10 @@ def preprocess(df, label_col, dataset_name='', verbose=True):
     X = df.drop(columns=[label_col]).apply(
         pd.to_numeric, errors='coerce').fillna(0).values.astype(np.float32)
     
-    scaler = StandardScaler()
-    X = scaler.fit_transform(X).astype(np.float32)
+    scaler = None
+    if scale:
+        scaler = StandardScaler()
+        X = scaler.fit_transform(X).astype(np.float32)
     
     if verbose:
         unique, counts = np.unique(y_raw, return_counts=True)
@@ -98,9 +119,55 @@ def preprocess(df, label_col, dataset_name='', verbose=True):
     return X, y_raw, scaler
 
 
-def balance_data(X, y, max_majority=10000, min_minority=300, seed=SEED, verbose=True):
+def fit_transform_feature_scaler(X_train, X_test=None, verbose=True):
+    """Fit StandardScaler on training features and reuse it for test features."""
+    scaler = StandardScaler()
+    X_train_scaled = scaler.fit_transform(X_train).astype(np.float32)
+    if verbose:
+        print(f'   Scaler fit on train only: {X_train.shape[1]} features')
+    if X_test is None:
+        return X_train_scaled, scaler
+    X_test_scaled = scaler.transform(X_test).astype(np.float32)
+    return X_train_scaled, X_test_scaled, scaler
+
+
+def _format_distribution(y, max_items=12):
+    counts = Counter(y)
+    items = sorted(counts.items(), key=lambda item: item[1], reverse=True)
+    shown = ', '.join(f'{cls}:{cnt}' for cls, cnt in items[:max_items])
+    if len(items) > max_items:
+        shown += f', ... (+{len(items) - max_items} classes)'
+    return '{' + shown + '}'
+
+
+def log_class_distribution(title, y, max_items=12):
+    print(f'   {title}: {_format_distribution(y, max_items=max_items)}')
+
+
+def _stratify_labels_or_none(y):
+    _, counts = np.unique(y, return_counts=True)
+    if len(counts) > 1 and counts.min() >= 2:
+        return y
+    return None
+
+
+def balance_data(
+    X,
+    y,
+    max_majority=None,
+    min_minority=0,
+    seed=SEED,
+    verbose=True,
+    majority_keep_fraction=0.50,
+    majority_multiplier=8,
+    min_majority_keep=50000,
+):
     """
-    Balance dataset using SMOTE and undersampling.
+    Moderately balance data without collapsing large classes.
+
+    This function is intentionally conservative. The research pipeline now
+    prefers class weighting, and this sampler is kept for explicit hybrid
+    experiments only.
     
     Args:
         X: Features
@@ -115,21 +182,33 @@ def balance_data(X, y, max_majority=10000, min_minority=300, seed=SEED, verbose=
     """
     counts = Counter(y)
     if verbose:
-        print(f'  Before balance: {dict(counts)}')
+        log_class_distribution('Before balancing', y)
     
-    # Undersampling for majority classes
-    under_strategy = {cls: min(cnt, max_majority)
-                      for cls, cnt in counts.items() if cnt > max_majority}
+    nonzero_counts = np.array(list(counts.values()), dtype=np.int64)
+    median_count = int(np.median(nonzero_counts)) if len(nonzero_counts) else 0
+    adaptive_cap = max(min_majority_keep, int(median_count * majority_multiplier))
+    if max_majority is not None:
+        adaptive_cap = max(int(max_majority), min_majority_keep)
+
+    under_strategy = {}
+    for cls, cnt in counts.items():
+        keep_by_fraction = int(np.ceil(cnt * majority_keep_fraction))
+        target = max(keep_by_fraction, adaptive_cap)
+        target = min(cnt, target)
+        if target < cnt:
+            under_strategy[cls] = target
+
     if under_strategy:
         rus = RandomUnderSampler(sampling_strategy=under_strategy, random_state=seed)
         X, y = rus.fit_resample(X, y)
     
-    # SMOTE for minority classes
+    # Optional minority support for experiments. Default is disabled because
+    # class weights preserve the original sample distribution more faithfully.
     counts2 = Counter(y)
-    min_count = min(counts2.values())
+    min_count = min(counts2.values()) if counts2 else 0
     k = min(5, min_count - 1)
-    
-    if k >= 1:
+
+    if min_minority > 0 and k >= 1:
         over_strategy = {cls: max(cnt, min_minority)
                          for cls, cnt in counts2.items() if cnt < min_minority}
         if over_strategy:
@@ -142,14 +221,240 @@ def balance_data(X, y, max_majority=10000, min_minority=300, seed=SEED, verbose=
                     print(f'  ⚠️  SMOTE skipped: {e}')
     
     if verbose:
-        print(f'  After  balance: {dict(Counter(y))}')
+        log_class_distribution('After balancing ', y)
     
     return X, y
 
 
-def select_features_mi(X, y, k_features, dataset_name=''):
+def compute_class_weight_vector(y_encoded, n_classes=None, class_names=None, verbose=True):
+    """Compute sklearn balanced class weights for encoded training labels."""
+    y_encoded = np.asarray(y_encoded, dtype=np.int64)
+    if n_classes is None:
+        n_classes = int(y_encoded.max()) + 1 if y_encoded.size else 0
+
+    weights = np.ones(n_classes, dtype=np.float32)
+    present_classes = np.unique(y_encoded)
+    if present_classes.size:
+        present_weights = compute_class_weight(
+            class_weight='balanced',
+            classes=present_classes,
+            y=y_encoded,
+        ).astype(np.float32)
+        weights[present_classes] = present_weights
+
+    if verbose:
+        names = (
+            list(class_names)
+            if class_names is not None and len(class_names) == n_classes
+            else [str(i) for i in range(n_classes)]
+        )
+        summary = ', '.join(
+            f'{names[idx]}={weights[idx]:.4f}' for idx in range(n_classes)
+        )
+        print(f'   Class weights: {summary}')
+
+    return weights
+
+
+def make_class_weight_tensor(y_encoded, n_classes, device, class_names=None, verbose=True):
+    weights = compute_class_weight_vector(
+        y_encoded,
+        n_classes=n_classes,
+        class_names=class_names,
+        verbose=verbose,
+    )
+    return torch.tensor(weights, dtype=torch.float32, device=device)
+
+
+@dataclass
+class MIFeatureSelector:
+    """Small reusable MI selector that stores and reapplies selected columns."""
+    selected_indices: np.ndarray
+    selected_names: list
+    feature_names: list
+    mi_scores: np.ndarray
+    k_features: int
+    original_feature_count: int
+    dataset_name: str = ''
+    reduction_applied: bool = True
+
+    def transform(self, X):
+        return X[:, self.selected_indices].astype(np.float32, copy=False)
+
+    def fit_transform(self, X, y=None):
+        return self.transform(X)
+
+    def get_support(self, indices=False):
+        if indices:
+            return self.selected_indices
+        mask = np.zeros(self.original_feature_count, dtype=bool)
+        mask[self.selected_indices] = True
+        return mask
+
+
+def dataset_feature_count(dataset_name, override=None):
+    """Resolve dataset-specific MI feature count; None means use all features."""
+    if override is not None:
+        return override
+    return DATASET_FEATURE_COUNTS.get(dataset_name, 20)
+
+
+def _default_feature_names(n_features):
+    return [f'feature_{idx}' for idx in range(n_features)]
+
+
+def _log_mi_selection(selector, top_n=10):
+    if not selector.dataset_name:
+        return
+
+    action = (
+        f'{selector.original_feature_count} features to {selector.k_features}'
+        if selector.reduction_applied
+        else f'using all {selector.original_feature_count} features'
+    )
+    print(f'🔹 {selector.dataset_name} → {action}')
+
+    if selector.mi_scores.size == 0:
+        print('   MI ranking skipped because no feature reduction was applied.')
+        return
+
+    ranked = np.argsort(selector.mi_scores)[::-1]
+    print('   Top MI scores:')
+    for rank, idx in enumerate(ranked[:top_n], start=1):
+        name = selector.feature_names[idx]
+        print(f'     {rank:2d}. {name}: {selector.mi_scores[idx]:.6f}')
+
+    selected = ', '.join(selector.selected_names[:top_n])
+    if len(selector.selected_names) > top_n:
+        selected += ', ...'
+    print(f'   Selected {len(selector.selected_names)} features: {selected}')
+
+
+def fit_mi_feature_selector(
+    X_train,
+    y_train,
+    dataset_name='',
+    k_features=None,
+    feature_names=None,
+    seed=SEED,
+    verbose=True,
+    max_mi_samples=200000,
+):
     """
-    Select top-k features using mutual information.
+    Fit a Mutual Information feature selector on training data only.
+
+    Args:
+        X_train: Training features
+        y_train: Training labels
+        dataset_name: Dataset name used to resolve default feature count
+        k_features: Optional override; None may mean no reduction for configured datasets
+        feature_names: Optional original feature names
+        seed: Random seed for mutual_info_classif
+        verbose: Print selected feature details
+        max_mi_samples: Stratified sample size for MI scoring on very large data
+
+    Returns:
+        MIFeatureSelector with stored feature indices/names and MI scores
+    """
+    n_features = X_train.shape[1]
+    feature_names = list(feature_names) if feature_names is not None else _default_feature_names(n_features)
+    if len(feature_names) != n_features:
+        feature_names = _default_feature_names(n_features)
+
+    resolved_k = dataset_feature_count(dataset_name, override=k_features)
+    if resolved_k is None or resolved_k >= n_features:
+        selector = MIFeatureSelector(
+            selected_indices=np.arange(n_features),
+            selected_names=feature_names,
+            feature_names=feature_names,
+            mi_scores=np.array([], dtype=np.float32),
+            k_features=n_features,
+            original_feature_count=n_features,
+            dataset_name=dataset_name,
+            reduction_applied=False,
+        )
+        if verbose:
+            _log_mi_selection(selector)
+        return selector
+
+    k = max(1, min(int(resolved_k), n_features))
+    X_mi, y_mi = X_train, y_train
+    if max_mi_samples is not None and len(X_train) > max_mi_samples:
+        indices = np.arange(len(X_train))
+        stratify = _stratify_labels_or_none(y_train)
+        sample_idx, _ = train_test_split(
+            indices,
+            train_size=int(max_mi_samples),
+            random_state=seed,
+            stratify=stratify,
+        )
+        X_mi, y_mi = X_train[sample_idx], y_train[sample_idx]
+        if verbose and dataset_name:
+            print(f'   MI ranking sample: {len(X_mi):,}/{len(X_train):,} training rows')
+
+    mi_scores = mutual_info_classif(X_mi, y_mi, random_state=seed)
+    mi_scores = np.nan_to_num(mi_scores, nan=0.0, posinf=0.0, neginf=0.0)
+    selected_indices = np.argsort(mi_scores)[::-1][:k]
+    selected_indices = np.sort(selected_indices)
+    selected_names = [feature_names[idx] for idx in selected_indices]
+
+    selector = MIFeatureSelector(
+        selected_indices=selected_indices,
+        selected_names=selected_names,
+        feature_names=feature_names,
+        mi_scores=mi_scores,
+        k_features=k,
+        original_feature_count=n_features,
+        dataset_name=dataset_name,
+        reduction_applied=True,
+    )
+    if verbose:
+        _log_mi_selection(selector)
+    return selector
+
+
+def apply_mi_feature_selection(
+    X_train,
+    y_train,
+    X_test=None,
+    dataset_name='',
+    k_features=None,
+    feature_names=None,
+    seed=SEED,
+    verbose=True,
+    max_mi_samples=200000,
+):
+    """Fit MI selector on training data, then reuse it for train/test transforms."""
+    selector = fit_mi_feature_selector(
+        X_train,
+        y_train,
+        dataset_name=dataset_name,
+        k_features=k_features,
+        feature_names=feature_names,
+        seed=seed,
+        verbose=verbose,
+        max_mi_samples=max_mi_samples,
+    )
+    X_train_selected = selector.transform(X_train)
+    if X_test is None:
+        return X_train_selected, selector
+    return X_train_selected, selector.transform(X_test), selector
+
+
+def select_features_mi(
+    X,
+    y,
+    k_features=None,
+    dataset_name='',
+    feature_names=None,
+    seed=SEED,
+    max_mi_samples=200000,
+):
+    """
+    Backward-compatible helper for selecting features from a single matrix.
+
+    Prefer apply_mi_feature_selection for train/test pipelines so the selector is
+    fitted on training data only and then reused for validation/test data.
     
     Args:
         X: Features
@@ -160,22 +465,30 @@ def select_features_mi(X, y, k_features, dataset_name=''):
     Returns:
         (X_selected, selector): Reduced features and fitted selector
     """
-    k = min(k_features, X.shape[1])
-    if dataset_name:
-        print(f'🔹 {dataset_name} → {X.shape[1]} features to {k}')
-    
-    sel = SelectKBest(mutual_info_classif, k=k)
-    X_sel = sel.fit_transform(X, y)
-    
-    if dataset_name:
-        top_score = sel.scores_[sel.get_support()].max()
-        print(f'   ⭐ Top MI score: {top_score:.4f}')
-    
-    return X_sel, sel
+    return apply_mi_feature_selection(
+        X,
+        y,
+        X_test=None,
+        dataset_name=dataset_name,
+        k_features=k_features,
+        feature_names=feature_names,
+        seed=seed,
+        verbose=True,
+        max_mi_samples=max_mi_samples,
+    )
 
 
-def create_open_set_split(X, y, unknown_classes, test_size=0.30, seed=SEED,
-                         balance_train=True, verbose=True):
+def create_open_set_split(
+    X,
+    y,
+    unknown_classes,
+    test_size=0.30,
+    seed=SEED,
+    balance_train=False,
+    verbose=True,
+    dataset_name='',
+    balance_kwargs=None,
+):
     """
     Create open-set split: withheld unknown classes at test time.
     
@@ -185,29 +498,52 @@ def create_open_set_split(X, y, unknown_classes, test_size=0.30, seed=SEED,
         unknown_classes: Classes to treat as unknown
         test_size: Test set fraction
         seed: Random seed
-        balance_train: Whether to balance training set
+        balance_train: Whether to apply optional moderate hybrid balancing
         verbose: Print progress
     
     Returns:
         (X_train, y_train, X_test, y_test, known_classes, unknown_classes)
     """
-    X_tr, X_te, y_train, y_test = train_test_split(
-        X, y, test_size=test_size, random_state=seed, stratify=y)
+    test_size = 0.30 if test_size is None else test_size
+    stratify = _stratify_labels_or_none(y)
+    X_tr_all, X_te, y_train_all, y_test_raw = train_test_split(
+        X,
+        y,
+        test_size=test_size,
+        random_state=seed,
+        stratify=stratify,
+    )
     
     # Remove unknown classes from training
-    known_mask = ~np.isin(y_train, unknown_classes)
-    X_tr, y_train = X_tr[known_mask], y_train[known_mask]
+    known_mask = ~np.isin(y_train_all, unknown_classes)
+    X_tr, y_train = X_tr_all[known_mask], y_train_all[known_mask]
+
+    if verbose:
+        title = f'{dataset_name} split' if dataset_name else 'Open-set split'
+        split_mode = 'stratified' if stratify is not None else 'non-stratified fallback for singleton classes'
+        print(f'\n🔀 {title}: 70/30 {split_mode} train/test')
+        log_class_distribution('Full distribution', y)
+        log_class_distribution('Train before unknown removal', y_train_all)
+        removed_unknown = y_train_all[~known_mask]
+        if len(removed_unknown):
+            log_class_distribution('Unknown removed from train', removed_unknown)
+        log_class_distribution('Known train before balancing', y_train)
+        log_class_distribution('Raw test distribution', y_test_raw)
     
-    # Balance training set
     if balance_train:
-        X_tr, y_train = balance_data(X_tr, y_train, verbose=verbose)
+        kwargs = balance_kwargs or {}
+        X_tr, y_train = balance_data(X_tr, y_train, verbose=verbose, **kwargs)
+    elif verbose:
+        print('   Balancing: disabled; class weights should handle imbalance.')
     
     # Mark unknowns in test set
-    y_test = np.array([LABEL_UNKNOWN if l in unknown_classes else l for l in y_test])
+    y_test = np.array([LABEL_UNKNOWN if l in unknown_classes else l for l in y_test_raw])
     known_cls = np.unique(y_train)
     unk_count = np.sum(y_test == LABEL_UNKNOWN)
     
     if verbose:
+        log_class_distribution('Final known train distribution', y_train)
+        log_class_distribution('Final open-set test distribution', y_test)
         print(f'   Train: {len(X_tr):,}  Test: {len(X_te):,}  Unknown-in-test: {unk_count:,}')
     
     return X_tr, y_train, X_te, y_test, known_cls, unknown_classes
@@ -420,7 +756,7 @@ def predict_open_set(model, X_test, recon_threshold, conf_threshold=0.70,
     
     with torch.no_grad():
         recon_out, mu, _, logits = model(X_t)
-        probs = logits.cpu().numpy()
+        probs = torch.softmax(logits, dim=1).cpu().numpy()
         recon_err = F.mse_loss(recon_out, X_t, reduction='none').mean(dim=1).cpu().numpy()
     
     # Normalize reconstruction errors

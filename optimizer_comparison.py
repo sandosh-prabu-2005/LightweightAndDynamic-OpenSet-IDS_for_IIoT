@@ -20,6 +20,7 @@ import torch
 import torch.nn.functional as F
 import torch.optim as optim
 from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 from torch.utils.data import DataLoader, TensorDataset
 
@@ -27,19 +28,24 @@ from model import VAEWithTeacher
 from optimizer import ABAO_V2, CRAZYFOX
 from utils import (
     LABEL_UNKNOWN,
+    apply_mi_feature_selection,
     SEED,
     compute_detection_metrics,
     create_open_set_split,
     detect_unknown_evt,
+    fit_transform_feature_scaler,
+    make_class_weight_tensor,
     preprocess,
     safe_load,
-    select_features_mi,
     set_seed,
 )
 
 warnings.filterwarnings("ignore")
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+VALIDATION_SPLIT = 0.20
+EARLY_STOPPING_PATIENCE = 40
+EARLY_STOPPING_MIN_DELTA = 1e-4
 
 DATASET_PATHS = {
     "NSL-KDD": ("NSLKDD/nsl-train.csv", "class"),
@@ -58,7 +64,7 @@ UNKNOWN_CLASSES = {
 DATASET_CONFIG = {
     "NSL-KDD": {
         "latent_dim": 32,
-        "k_features": 20,
+        "k_features": 30,
         "beta_kl": 0.8,
         "tail_pct": 0.10,
         "q_start": 0.75,
@@ -67,7 +73,7 @@ DATASET_CONFIG = {
     },
     "CICIDS2017": {
         "latent_dim": 32,
-        "k_features": 20,
+        "k_features": 40,
         "beta_kl": 1.0,
         "tail_pct": 0.10,
         "q_start": 0.75,
@@ -76,7 +82,7 @@ DATASET_CONFIG = {
     },
     "Gas Pipeline": {
         "latent_dim": 32,
-        "k_features": 20,
+        "k_features": 25,
         "beta_kl": 1.0,
         "tail_pct": 0.10,
         "q_start": 0.75,
@@ -85,7 +91,7 @@ DATASET_CONFIG = {
     },
     "Water Storage": {
         "latent_dim": 48,
-        "k_features": 23,
+        "k_features": None,
         "beta_kl": 0.3,
         "tail_pct": 0.35,
         "q_start": 0.40,
@@ -106,6 +112,8 @@ class PreparedDataset:
     label_encoder: LabelEncoder
     n_classes: int
     input_dim: int
+    feature_selector: object
+    feature_scaler: object
 
 
 def set_all_seeds(seed=SEED):
@@ -131,9 +139,9 @@ def prepare_dataset(args):
     if df is None:
         raise FileNotFoundError(f"Dataset not found: {dataset_path}")
 
-    X, y, _ = preprocess(df, label_col, args.dataset, verbose=True)
+    feature_names = [col for col in df.columns if col != label_col]
+    X, y, _ = preprocess(df, label_col, args.dataset, verbose=True, scale=False)
     k_features = args.k_features if args.k_features is not None else cfg["k_features"]
-    X, _ = select_features_mi(X, y, k_features, args.dataset)
 
     X_train, y_train, X_test, y_test, known_classes, _ = create_open_set_split(
         X,
@@ -141,7 +149,24 @@ def prepare_dataset(args):
         UNKNOWN_CLASSES.get(args.dataset, []),
         test_size=args.test_size,
         seed=args.seed,
-        balance_train=True,
+        balance_train=False,
+        dataset_name=args.dataset,
+        verbose=True,
+    )
+
+    X_train, X_test, feature_selector = apply_mi_feature_selection(
+        X_train,
+        y_train,
+        X_test=X_test,
+        dataset_name=args.dataset,
+        k_features=k_features,
+        feature_names=feature_names,
+        seed=args.seed,
+        verbose=True,
+    )
+    X_train, X_test, feature_scaler = fit_transform_feature_scaler(
+        X_train,
+        X_test,
         verbose=True,
     )
 
@@ -159,6 +184,8 @@ def prepare_dataset(args):
         label_encoder=label_encoder,
         n_classes=len(label_encoder.classes_),
         input_dim=X_train.shape[1],
+        feature_selector=feature_selector,
+        feature_scaler=feature_scaler,
     )
 
 
@@ -189,12 +216,12 @@ def make_optimizer(optimizer_name, parameters, lr, weight_decay):
     raise ValueError(f"Unsupported optimizer: {optimizer_name}")
 
 
-def loss_components(model, xb, yb, beta_kl):
+def loss_components(model, xb, yb, beta_kl, class_weights=None):
     recon, mu, logvar, logits = model(xb)
     recon_error = F.mse_loss(recon, xb, reduction="none").mean(dim=1)
     loss_recon = F.mse_loss(recon, xb, reduction="mean")
     loss_kl = beta_kl * -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-    loss_cls = F.cross_entropy(logits, yb)
+    loss_cls = F.cross_entropy(logits, yb, weight=class_weights)
     loss = loss_recon + loss_kl + loss_cls
     return loss, loss_recon, loss_kl, loss_cls, logits, recon_error, mu
 
@@ -228,14 +255,14 @@ def step_optimizer(
     )
 
     if optimizer_name == "ABAO-V2":
-        confidence = logits.detach().max(dim=1).values.mean().item()
+        confidence = torch.softmax(logits.detach(), dim=1).max(dim=1).values.mean().item()
         optimizer.step(
             loss_cls=loss_cls.detach().item(),
             loss_rec=loss_recon.detach().item(),
             conf=confidence,
         )
     elif optimizer_name == "CRAZYFOX":
-        confidence = logits.detach().max(dim=1).values.mean().item()
+        confidence = torch.softmax(logits.detach(), dim=1).max(dim=1).values.mean().item()
         optimizer.step(
             loss_cls=loss_cls.detach().item(),
             loss_kl=loss_kl.detach().item(),
@@ -252,6 +279,55 @@ def step_optimizer(
     return loss.detach().item()
 
 
+def split_train_validation(X, y, validation_split, seed):
+    if validation_split <= 0 or len(np.unique(y)) <= 1:
+        return X, y, X[:0], y[:0]
+
+    counts = np.bincount(y)
+    stratify = y if counts.size and counts.min() >= 2 else None
+    return train_test_split(
+        X,
+        y,
+        test_size=validation_split,
+        random_state=seed,
+        stratify=stratify,
+    )
+
+
+@torch.no_grad()
+def evaluate_supervised_epoch(model, loader, beta_kl, class_weights=None):
+    model.eval()
+    total_loss = 0.0
+    total_recon = 0.0
+    total_kl = 0.0
+    total_cls = 0.0
+    total_correct = 0
+    total_seen = 0
+
+    for xb, yb in loader:
+        xb = xb.to(DEVICE)
+        yb = yb.to(DEVICE)
+
+        loss, loss_recon, loss_kl, loss_cls, logits, _, _ = loss_components(
+            model, xb, yb, beta_kl, class_weights=class_weights
+        )
+        batch_size_actual = xb.size(0)
+        total_loss += loss.detach().item() * batch_size_actual
+        total_recon += loss_recon.detach().item() * batch_size_actual
+        total_kl += loss_kl.detach().item() * batch_size_actual
+        total_cls += loss_cls.detach().item() * batch_size_actual
+        total_correct += (logits.argmax(dim=1) == yb).sum().item()
+        total_seen += batch_size_actual
+
+    return {
+        "loss": total_loss / total_seen,
+        "recon_loss": total_recon / total_seen,
+        "kl_loss": total_kl / total_seen,
+        "cls_loss": total_cls / total_seen,
+        "accuracy": total_correct / total_seen,
+    }
+
+
 def train_model(
     prepared,
     optimizer_name,
@@ -262,6 +338,9 @@ def train_model(
     beta_kl,
     weight_decay,
     seed,
+    validation_split=VALIDATION_SPLIT,
+    early_stopping_patience=EARLY_STOPPING_PATIENCE,
+    early_stopping_min_delta=EARLY_STOPPING_MIN_DELTA,
 ):
     set_all_seeds(seed)
 
@@ -275,19 +354,50 @@ def train_model(
     generator = torch.Generator()
     generator.manual_seed(seed)
 
-    X_tensor = torch.tensor(prepared.X_train, dtype=torch.float32)
-    y_tensor = torch.tensor(prepared.y_train_enc, dtype=torch.long)
+    X_fit, X_val, y_fit, y_val = split_train_validation(
+        prepared.X_train,
+        prepared.y_train_enc,
+        validation_split,
+        seed,
+    )
+    class_weights = make_class_weight_tensor(
+        y_fit,
+        prepared.n_classes,
+        DEVICE,
+        class_names=prepared.label_encoder.classes_,
+        verbose=True,
+    )
+
+    X_tensor = torch.tensor(X_fit, dtype=torch.float32)
+    y_tensor = torch.tensor(y_fit, dtype=torch.long)
     loader = DataLoader(
         TensorDataset(X_tensor, y_tensor),
         batch_size=batch_size,
         shuffle=True,
         generator=generator,
     )
+    val_loader = None
+    if len(X_val) > 0:
+        val_loader = DataLoader(
+            TensorDataset(
+                torch.tensor(X_val, dtype=torch.float32),
+                torch.tensor(y_val, dtype=torch.long),
+            ),
+            batch_size=batch_size,
+            shuffle=False,
+        )
 
     history = []
+    best_state = None
+    best_val_loss = math.inf
+    best_epoch = 0
+    epochs_without_improvement = 0
     for epoch in range(1, epochs + 1):
         model.train()
         total_loss = 0.0
+        total_recon = 0.0
+        total_kl = 0.0
+        total_cls = 0.0
         total_correct = 0
         total_seen = 0
         beta_eff = beta_kl * min(1.0, epoch / 40.0)
@@ -297,7 +407,7 @@ def train_model(
             yb = yb.to(DEVICE)
 
             loss, loss_recon, loss_kl, loss_cls, logits, recon_error, z = loss_components(
-                model, xb, yb, beta_eff
+                model, xb, yb, beta_eff, class_weights=class_weights
             )
 
             if optimizer_name == "CRAZYFOX":
@@ -332,16 +442,58 @@ def train_model(
 
             batch_size_actual = xb.size(0)
             total_loss += batch_loss * batch_size_actual
+            total_recon += loss_recon.detach().item() * batch_size_actual
+            total_kl += loss_kl.detach().item() * batch_size_actual
+            total_cls += loss_cls.detach().item() * batch_size_actual
             total_correct += (logits.argmax(dim=1) == yb).sum().item()
             total_seen += batch_size_actual
+
+        train_metrics = {
+            "loss": total_loss / total_seen,
+            "recon_loss": total_recon / total_seen,
+            "kl_loss": total_kl / total_seen,
+            "cls_loss": total_cls / total_seen,
+            "accuracy": total_correct / total_seen,
+        }
+        val_metrics = (
+            evaluate_supervised_epoch(model, val_loader, beta_eff, class_weights=class_weights)
+            if val_loader is not None else train_metrics
+        )
 
         history.append(
             {
                 "epoch": epoch,
-                "loss": total_loss / total_seen,
-                "train_accuracy": total_correct / total_seen,
+                "loss": train_metrics["loss"],
+                "train_loss": train_metrics["loss"],
+                "val_loss": val_metrics["loss"],
+                "train_accuracy": train_metrics["accuracy"],
+                "val_accuracy": val_metrics["accuracy"],
+                "train_recon_loss": train_metrics["recon_loss"],
+                "train_kl_loss": train_metrics["kl_loss"],
+                "train_cls_loss": train_metrics["cls_loss"],
+                "val_recon_loss": val_metrics["recon_loss"],
+                "val_kl_loss": val_metrics["kl_loss"],
+                "val_cls_loss": val_metrics["cls_loss"],
             }
         )
+
+        if val_metrics["loss"] < best_val_loss - early_stopping_min_delta:
+            best_val_loss = val_metrics["loss"]
+            best_epoch = epoch
+            best_state = copy.deepcopy(model.state_dict())
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+
+        if epochs_without_improvement >= early_stopping_patience:
+            print(
+                f"    Early stopping at epoch {epoch}/{epochs}; "
+                f"restoring epoch {best_epoch} (val_loss={best_val_loss:.4f})"
+            )
+            break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
 
     return model, history
 
@@ -435,6 +587,9 @@ def train_and_evaluate(
     q_end,
     norm_mode,
     seed,
+    validation_split,
+    early_stopping_patience,
+    early_stopping_min_delta,
 ):
     model, history = train_model(
         prepared=prepared,
@@ -446,6 +601,9 @@ def train_and_evaluate(
         beta_kl=beta_kl,
         weight_decay=weight_decay,
         seed=seed,
+        validation_split=validation_split,
+        early_stopping_patience=early_stopping_patience,
+        early_stopping_min_delta=early_stopping_min_delta,
     )
     metrics = evaluate_model(
         prepared=prepared,
@@ -458,6 +616,11 @@ def train_and_evaluate(
     )
     metrics["optimizer"] = optimizer_name
     metrics["final_train_loss"] = history[-1]["loss"] if history else math.nan
+    metrics["final_val_loss"] = history[-1]["val_loss"] if history else math.nan
+    metrics["best_val_loss"] = (
+        min(row["val_loss"] for row in history) if history else math.nan
+    )
+    metrics["epochs_ran"] = len(history)
     return metrics, model, history
 
 
@@ -485,7 +648,7 @@ def parse_args():
         help="Retained for compatibility; this script runs all datasets.",
     )
     parser.add_argument("--data-dir", default="/home/sandosh-prabu/Desktop/DATASET")
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--epochs", type=int, default=500)
     parser.add_argument("--final-epochs", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=512)
     parser.add_argument("--lr", type=float, default=3e-4)
@@ -499,6 +662,9 @@ def parse_args():
     parser.add_argument("--q-start", type=float, default=None)
     parser.add_argument("--q-end", type=float, default=None)
     parser.add_argument("--norm-mode", choices=["minmax", "zscore"], default=None)
+    parser.add_argument("--validation-split", type=float, default=VALIDATION_SPLIT)
+    parser.add_argument("--early-stopping-patience", type=int, default=EARLY_STOPPING_PATIENCE)
+    parser.add_argument("--early-stopping-min-delta", type=float, default=EARLY_STOPPING_MIN_DELTA)
     parser.add_argument("--csv-path", default="optimizer_per_dataset.csv")
     parser.add_argument("--average-csv-path", default="optimizer_average.csv")
     parser.add_argument("--plot-path", default="avg_optimizer_f1.png")
@@ -572,6 +738,9 @@ def main():
                     q_end=q_end,
                     norm_mode=norm_mode,
                     seed=args.seed,
+                    validation_split=args.validation_split,
+                    early_stopping_patience=args.early_stopping_patience,
+                    early_stopping_min_delta=args.early_stopping_min_delta,
                 )
                 metrics["dataset"] = dataset_name
                 all_results.append(metrics)

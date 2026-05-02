@@ -27,16 +27,18 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from sklearn.preprocessing import LabelEncoder
 from sklearn.metrics import classification_report, confusion_matrix
+from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
 # Import custom modules
 from model import VAEWithTeacher, StudentNet
 from optimizer import ABAO_V2
 from utils import (
-    set_seed, safe_load, preprocess, balance_data, select_features_mi,
+    set_seed, safe_load, preprocess, apply_mi_feature_selection,
+    fit_transform_feature_scaler,
     create_open_set_split, detect_unknown_evt, extract_latent_z,
     build_update_dataset, compute_detection_metrics, predict_open_set,
-    LABEL_UNKNOWN, SEED
+    make_class_weight_tensor, LABEL_UNKNOWN, SEED
 )
 
 warnings.filterwarnings('ignore')
@@ -49,9 +51,9 @@ warnings.filterwarnings('ignore')
 DS_CONFIG = {
     'NSL-KDD': {
         'latent_dim': 32,
-        'epochs': 100,
+        'epochs': 500,
         'beta_kl': 0.8,
-        'k_features': 20,
+        'k_features': 30,
         'evt_tail_pct': 0.10,
         'evt_q_start': 0.75,
         'evt_q_end': 0.98,
@@ -60,9 +62,9 @@ DS_CONFIG = {
     },
     'CICIDS2017': {
         'latent_dim': 32,
-        'epochs': 100,
+        'epochs': 500,
         'beta_kl': 1.0,
-        'k_features': 20,
+        'k_features': 40,
         'evt_tail_pct': 0.10,
         'evt_q_start': 0.75,
         'evt_q_end': 0.98,
@@ -71,9 +73,9 @@ DS_CONFIG = {
     },
     'Gas Pipeline': {
         'latent_dim': 32,
-        'epochs': 100,
+        'epochs': 500,
         'beta_kl': 1.0,
-        'k_features': 20,
+        'k_features': 25,
         'evt_tail_pct': 0.10,
         'evt_q_start': 0.75,
         'evt_q_end': 0.98,
@@ -82,9 +84,9 @@ DS_CONFIG = {
     },
     'Water Storage': {
         'latent_dim': 48,
-        'epochs': 130,
+        'epochs': 700,
         'beta_kl': 0.3,
-        'k_features': 23,
+        'k_features': None,
         'evt_tail_pct': 0.35,
         'evt_q_start': 0.40,
         'evt_q_end': 0.80,
@@ -100,6 +102,9 @@ RF_THRESHOLD = 0.70
 WEIGHT_DECAY = 1e-4
 NUM_WORKERS = 4
 PIN_MEMORY = True
+VALIDATION_SPLIT = 0.20
+EARLY_STOPPING_PATIENCE = 40
+EARLY_STOPPING_MIN_DELTA = 1e-4
 
 # Device setup
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -113,12 +118,12 @@ if DEVICE.type == 'cuda':
 set_seed(SEED)
 
 
-def vae_loss_components(model, xb, yb, beta):
+def vae_loss_components(model, xb, yb, beta, class_weights=None):
     """Compute VAE losses as GPU tensors for custom optimizer support."""
     recon, mu, logvar, logits = model(xb)
     loss_rec = F.mse_loss(recon, xb, reduction='mean')
     loss_kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-    loss_cls = F.cross_entropy(logits, yb)
+    loss_cls = F.cross_entropy(logits, yb, weight=class_weights)
     recon_error = F.mse_loss(recon, xb, reduction='none').mean(dim=1)
     loss = loss_rec + beta * loss_kl + loss_cls
     return loss, loss_rec, loss_kl, loss_cls, recon_error, mu, logits
@@ -135,7 +140,7 @@ def step_abao_v2_optimizer(optimizer, loss, loss_rec, loss_cls, logits,
         max_norm=grad_clip
     )
 
-    confidence = logits.detach().max(dim=1).values.mean().item()
+    confidence = torch.softmax(logits.detach(), dim=1).max(dim=1).values.mean().item()
     optimizer.step(
         loss_cls=loss_cls.detach().item(),
         loss_rec=loss_rec.detach().item(),
@@ -143,6 +148,78 @@ def step_abao_v2_optimizer(optimizer, loss, loss_rec, loss_cls, logits,
     )
 
     return loss.detach().item()
+
+
+def make_train_val_loaders(X, y, batch_size, validation_split=VALIDATION_SPLIT):
+    """Create stratified train/validation loaders for known-class Stage 1 data."""
+    stratify = y if validation_split > 0 and np.min(np.bincount(y)) >= 2 else None
+    if validation_split > 0 and len(np.unique(y)) > 1:
+        X_fit, X_val, y_fit, y_val = train_test_split(
+            X,
+            y,
+            test_size=validation_split,
+            random_state=SEED,
+            stratify=stratify,
+        )
+    else:
+        X_fit, y_fit = X, y
+        X_val, y_val = X[:0], y[:0]
+
+    train_loader = DataLoader(
+        TensorDataset(
+            torch.tensor(X_fit, dtype=torch.float32),
+            torch.tensor(y_fit, dtype=torch.long),
+        ),
+        batch_size=batch_size,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        pin_memory=PIN_MEMORY,
+    )
+
+    val_loader = None
+    if len(X_val) > 0:
+        val_loader = DataLoader(
+            TensorDataset(
+                torch.tensor(X_val, dtype=torch.float32),
+                torch.tensor(y_val, dtype=torch.long),
+            ),
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=NUM_WORKERS,
+            pin_memory=PIN_MEMORY,
+        )
+
+    return train_loader, val_loader, y_fit, y_val
+
+
+@torch.no_grad()
+def evaluate_stage1_epoch(model, loader, beta, class_weights=None):
+    model.eval()
+    sum_loss = sum_Lr = sum_LKL = sum_Lc = 0.0
+    correct = total = 0
+
+    for xb, yb in loader:
+        xb = xb.to(DEVICE, non_blocking=DEVICE.type == 'cuda')
+        yb = yb.to(DEVICE, non_blocking=DEVICE.type == 'cuda')
+
+        loss, loss_rec, loss_kl, loss_cls, _, _, logits = vae_loss_components(
+            model, xb, yb, beta, class_weights=class_weights
+        )
+        n = len(xb)
+        sum_loss += loss.detach().item() * n
+        sum_Lr += loss_rec.detach().item() * n
+        sum_LKL += loss_kl.detach().item() * n
+        sum_Lc += loss_cls.detach().item() * n
+        correct += (logits.argmax(1) == yb).sum().item()
+        total += n
+
+    return {
+        'loss': sum_loss / total,
+        'Lr': sum_Lr / total,
+        'LKL': sum_LKL / total,
+        'Lc': sum_Lc / total,
+        'acc': correct / total,
+    }
 
 # ============================================================================
 # Stage 1: Train VAE + Teacher Classifier
@@ -152,7 +229,11 @@ def train_stage1(X_train, y_train, n_classes,
                  epochs=100, batch_size=512, lr=1e-3,
                  latent_dim=32, beta_kl=1.0, verbose_every=10,
                  spike_factor=5.0, patience=10, grad_clip=1.0,
-                 weight_decay=WEIGHT_DECAY):
+                 weight_decay=WEIGHT_DECAY,
+                 validation_split=VALIDATION_SPLIT,
+                 early_stopping_patience=EARLY_STOPPING_PATIENCE,
+                 early_stopping_min_delta=EARLY_STOPPING_MIN_DELTA,
+                 class_names=None):
     """
     Train VAE + Teacher Classifier with divergence detection.
     
@@ -167,8 +248,11 @@ def train_stage1(X_train, y_train, n_classes,
         beta_kl: KL divergence weight (β-VAE)
         verbose_every: Print every N epochs
         spike_factor: Loss spike detection threshold
-        patience: Patience for monotonic rise detection
+        patience: Retained for backward compatibility
         grad_clip: Gradient clipping norm
+        validation_split: Fraction of known training data used for validation
+        early_stopping_patience: Epochs without validation improvement before stop
+        early_stopping_min_delta: Minimum validation-loss improvement to reset patience
     
     Returns:
         (trained_model, history)
@@ -177,28 +261,35 @@ def train_stage1(X_train, y_train, n_classes,
         torch.cuda.empty_cache()
 
     print(f'\n🚀 Stage 1: Training VAE + Teacher')
-    print(f'   Latent dim: {latent_dim}, Epochs: {epochs}, β-KL: {beta_kl}')
+    print(f'   Latent dim: {latent_dim}, Max epochs: {epochs}, β-KL: {beta_kl}')
+    print(f'   Early stopping: patience={early_stopping_patience}, '
+          f'min_delta={early_stopping_min_delta}, val_split={validation_split}')
     
     input_dim = X_train.shape[1]
     model = VAEWithTeacher(input_dim, latent_dim, n_classes).to(DEVICE)
     optimizer = ABAO_V2(model.parameters(), lr=lr, weight_decay=weight_decay)
     print('⚙️ Using Optimizer: ABAO-V2')
     
-    X_t = torch.tensor(X_train, dtype=torch.float32)
-    y_t = torch.tensor(y_train, dtype=torch.long)
-    loader = DataLoader(
-        TensorDataset(X_t, y_t),
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=NUM_WORKERS,
-        pin_memory=PIN_MEMORY
+    loader, val_loader, y_fit, _ = make_train_val_loaders(
+        X_train,
+        y_train,
+        batch_size,
+        validation_split=validation_split,
+    )
+    class_weights = make_class_weight_tensor(
+        y_fit,
+        n_classes,
+        DEVICE,
+        class_names=class_names,
+        verbose=True,
     )
     
     history = []
-    best_loss = math.inf
+    best_train_loss = math.inf
+    best_val_loss = math.inf
+    best_epoch = 0
     best_state = None
-    consecutive_rises = 0
-    prev_loss = math.inf
+    epochs_without_improvement = 0
     
     for epoch in range(1, epochs + 1):
         model.train()
@@ -212,7 +303,7 @@ def train_stage1(X_train, y_train, n_classes,
             # KL warmup: linear ramp over first 40 epochs
             beta = beta_kl * min(1.0, epoch / 40)
             loss, loss_rec, loss_kl, loss_cls, recon_error, z, logits = vae_loss_components(
-                model, xb, yb, beta)
+                model, xb, yb, beta, class_weights=class_weights)
 
             if not torch.isfinite(loss):
                 print(f'\n  ⛔ DIVERGENCE at epoch {epoch}: NaN/Inf')
@@ -237,57 +328,76 @@ def train_stage1(X_train, y_train, n_classes,
             correct += (logits.argmax(1) == yb).sum().item()
             total += n
         
-        avg_loss = sum_loss / total
-        acc = correct / total
-        
-        history.append({
-            'epoch': epoch,
-            'loss': avg_loss,
+        train_metrics = {
+            'loss': sum_loss / total,
             'Lr': sum_Lr / total,
             'LKL': sum_LKL / total,
             'Lc': sum_Lc / total,
-            'acc': acc,
+            'acc': correct / total,
+        }
+        val_metrics = (
+            evaluate_stage1_epoch(model, val_loader, beta, class_weights=class_weights)
+            if val_loader is not None else train_metrics
+        )
+        best_train_loss = min(best_train_loss, train_metrics['loss'])
+        
+        history.append({
+            'epoch': epoch,
+            'loss': train_metrics['loss'],
+            'acc': train_metrics['acc'],
+            'train_loss': train_metrics['loss'],
+            'train_accuracy': train_metrics['acc'],
+            'val_loss': val_metrics['loss'],
+            'val_accuracy': val_metrics['acc'],
+            'Lr': train_metrics['Lr'],
+            'LKL': train_metrics['LKL'],
+            'Lc': train_metrics['Lc'],
+            'val_Lr': val_metrics['Lr'],
+            'val_LKL': val_metrics['LKL'],
+            'val_Lc': val_metrics['Lc'],
+            'early_stop_monitor': 'val_loss' if val_loader is not None else 'train_loss',
         })
         
-        # Track best checkpoint
-        if avg_loss < best_loss:
-            best_loss = avg_loss
+        improved = val_metrics['loss'] < best_val_loss - early_stopping_min_delta
+        if improved:
+            best_val_loss = val_metrics['loss']
+            best_epoch = epoch
             best_state = copy.deepcopy(model.state_dict())
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
         
         # Divergence detection
-        if math.isnan(avg_loss) or math.isinf(avg_loss):
+        if math.isnan(train_metrics['loss']) or math.isinf(train_metrics['loss']):
             print(f'\n  ⛔ DIVERGENCE at epoch {epoch}: NaN/Inf')
             if best_state:
                 model.load_state_dict(best_state)
             return model, history
         
-        if avg_loss > best_loss * spike_factor and epoch > 5:
+        if train_metrics['loss'] > best_train_loss * spike_factor and epoch > 5:
             print(f'\n  ⛔ DIVERGENCE at epoch {epoch}: Loss spike')
             if best_state:
                 model.load_state_dict(best_state)
             return model, history
-        
-        if avg_loss > prev_loss:
-            consecutive_rises += 1
-        else:
-            consecutive_rises = 0
-        
-        if consecutive_rises >= patience:
-            print(f'\n  ⛔ DIVERGENCE at epoch {epoch}: Monotonic rise')
+
+        if epochs_without_improvement >= early_stopping_patience:
+            print(f'\n  ⏹️ Early stopping at epoch {epoch}. '
+                  f'Best epoch={best_epoch}, best val_loss={best_val_loss:.4f}')
             if best_state:
                 model.load_state_dict(best_state)
             return model, history
         
-        prev_loss = avg_loss
-        
         if epoch % verbose_every == 0 or epoch == 1:
             print(f'  Epoch {epoch:3d}/{epochs} | '
-                  f'Loss={avg_loss:.4f} Lr={sum_Lr/total:.4f} '
-                  f'β·LKL={beta_kl*sum_LKL/total:.4f} Acc={acc:.4f}')
+                  f'TrainLoss={train_metrics["loss"]:.4f} '
+                  f'ValLoss={val_metrics["loss"]:.4f} '
+                  f'TrainAcc={train_metrics["acc"]:.4f} '
+                  f'ValAcc={val_metrics["acc"]:.4f}')
     
     if best_state:
         model.load_state_dict(best_state)
-    print(f'  ✅ Training complete. Best loss={best_loss:.4f}')
+    print(f'  ✅ Training complete. Restored epoch {best_epoch} '
+          f'with best val_loss={best_val_loss:.4f}')
     return model, history
 
 
@@ -387,10 +497,17 @@ def stage3_knowledge_distillation(model, X_train, y_train, X_detected_unknown,
     optimizer = ABAO_V2(student.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
     print(f'⚙️ Using Optimizer: ABAO-V2 (Stage 3)')
     
-    ce_loss_fn = nn.CrossEntropyLoss()
-    kd_loss_fn = nn.KLDivLoss(reduction='batchmean')
-    
     y_upd_tensor = torch.tensor(y_upd_enc, dtype=torch.long).to(DEVICE)
+    student_class_weights = make_class_weight_tensor(
+        y_upd_enc,
+        len(le_student.classes_),
+        DEVICE,
+        class_names=le_student.classes_,
+        verbose=True,
+    )
+    ce_loss_fn = nn.CrossEntropyLoss(weight=student_class_weights)
+    kd_loss_fn = nn.KLDivLoss(reduction='batchmean')
+
     new_unk_enc = int(le_student.transform(['new_unknown'])[0])
     known_mask = y_upd_tensor != new_unk_enc
     known_student_indices = torch.tensor(
@@ -423,7 +540,7 @@ def stage3_knowledge_distillation(model, X_train, y_train, X_detected_unknown,
             loss_kd = torch.tensor(0.0, device=DEVICE)
         
         loss = 0.7 * loss_kd + 0.3 * loss_ce
-        confidence = student_logits.detach().max(dim=1).values.mean().item()
+        confidence = torch.softmax(student_logits.detach(), dim=1).max(dim=1).values.mean().item()
         
         optimizer.zero_grad()
         loss.backward()
@@ -486,8 +603,9 @@ def main():
     for ds_name, (path, label_col) in dataset_paths.items():
         df = safe_load(path, ds_name)
         if df is not None:
-            X, y, scaler = preprocess(df, label_col, ds_name, verbose=False)
-            datasets[ds_name] = (X, y, scaler)
+            feature_names = [col for col in df.columns if col != label_col]
+            X, y, scaler = preprocess(df, label_col, ds_name, verbose=False, scale=False)
+            datasets[ds_name] = (X, y, scaler, feature_names)
     
     print(f'\n✅ Loaded {len(datasets)} datasets')
     
@@ -495,7 +613,7 @@ def main():
     all_results = {}
     
     # Process each dataset
-    for ds_name, (X, y, scaler) in datasets.items():
+    for ds_name, (X, y, scaler, feature_names) in datasets.items():
         if DEVICE.type == 'cuda':
             torch.cuda.empty_cache()
 
@@ -508,7 +626,7 @@ def main():
         latent_dim = cfg.get('latent_dim', 32)
         epochs = cfg.get('epochs', 100)
         beta_kl = cfg.get('beta_kl', 1.0)
-        k_features = cfg.get('k_features', 20)
+        k_features = cfg.get('k_features')
         tail_pct = cfg.get('evt_tail_pct', 0.10)
         q_start = cfg.get('evt_q_start', 0.75)
         q_end = cfg.get('evt_q_end', 0.98)
@@ -518,15 +636,35 @@ def main():
         
         res = {}
         
-        # Feature selection
-        X_sel, sel = select_features_mi(X, y, k_features, ds_name)
-        
         # Open-set split
         X_tr, y_tr, X_te, y_te, known_cls, unk_cls = create_open_set_split(
-            X_sel, y,
+            X, y,
             unknown_classes.get(ds_name, []),
-            verbose=False
+            test_size=0.30,
+            balance_train=False,
+            dataset_name=ds_name,
+            verbose=True,
         )
+
+        # Fit MI selector only on known training data; reuse columns for test data.
+        X_tr, X_te, feature_selector = apply_mi_feature_selection(
+            X_tr,
+            y_tr,
+            X_test=X_te,
+            dataset_name=ds_name,
+            k_features=k_features,
+            feature_names=feature_names,
+            seed=SEED,
+            verbose=True,
+        )
+        res['feature_selector'] = feature_selector
+
+        X_tr, X_te, feature_scaler = fit_transform_feature_scaler(
+            X_tr,
+            X_te,
+            verbose=True,
+        )
+        res['feature_scaler'] = feature_scaler
         
         # Encode labels
         le = LabelEncoder()
@@ -539,7 +677,8 @@ def main():
             X_tr, y_tr_enc, n_cls,
             epochs=epochs, batch_size=BATCH_SIZE,
             lr=ds_lr, latent_dim=latent_dim, beta_kl=beta_kl,
-            weight_decay=WEIGHT_DECAY
+            weight_decay=WEIGHT_DECAY,
+            class_names=le.classes_,
         )
         res['teacher'] = teacher
         res['history1'] = hist1
@@ -573,6 +712,16 @@ def main():
             path = f'saved_models/{safe_name}_teacher.pt'
             torch.save(res['teacher'].state_dict(), path)
             print(f'  ✅ {path}')
+        if 'feature_selector' in res:
+            selector_path = f'saved_models/{safe_name}_feature_selector.pkl'
+            with open(selector_path, 'wb') as f:
+                pickle.dump(res['feature_selector'], f)
+            print(f'  ✅ {selector_path}')
+        if 'feature_scaler' in res:
+            scaler_path = f'saved_models/{safe_name}_feature_scaler.pkl'
+            with open(scaler_path, 'wb') as f:
+                pickle.dump(res['feature_scaler'], f)
+            print(f'  ✅ {scaler_path}')
     
     print('\n✅ Training complete!')
     return all_results
