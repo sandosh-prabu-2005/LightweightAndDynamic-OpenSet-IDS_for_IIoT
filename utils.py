@@ -151,6 +151,82 @@ def _stratify_labels_or_none(y):
     return None
 
 
+def apply_hybrid_balancing(
+    X,
+    y,
+    imbalance_threshold=20.0,
+    majority_keep_fraction=0.65,
+    seed=SEED,
+    verbose=True,
+):
+    """
+    Lightly reduce extreme majority classes while preserving most samples.
+
+    Class weighting remains the primary imbalance correction mechanism. This
+    helper only trims classes when the max/min ratio is clearly extreme.
+    """
+    counts = Counter(y)
+    if verbose:
+        log_class_distribution('Before balancing', y)
+
+    if len(counts) < 2:
+        if verbose:
+            print('   Hybrid balancing skipped: need at least two classes.')
+        return X, y
+
+    min_class_count = min(counts.values())
+    max_class_count = max(counts.values())
+    if min_class_count <= 0:
+        if verbose:
+            print('   Hybrid balancing skipped: invalid class counts.')
+        return X, y
+
+    imbalance_ratio = max_class_count / float(min_class_count)
+    if imbalance_ratio <= imbalance_threshold:
+        if verbose:
+            print(
+                f'   Hybrid balancing skipped: ratio={imbalance_ratio:.2f} '
+                f'<= threshold={imbalance_threshold:.2f}.'
+            )
+            log_class_distribution('After balancing ', y)
+        return X, y
+
+    majority_floor = int(np.ceil(min_class_count * imbalance_threshold))
+    under_strategy = {}
+    for cls, cnt in counts.items():
+        class_ratio = cnt / float(min_class_count)
+        if class_ratio <= imbalance_threshold:
+            continue
+
+        keep_fraction_target = int(np.ceil(cnt * majority_keep_fraction))
+        target = max(majority_floor, keep_fraction_target)
+        target = min(cnt, target)
+        if target < cnt:
+            under_strategy[cls] = target
+
+    if not under_strategy:
+        if verbose:
+            print('   Hybrid balancing skipped: no class exceeded the trim target.')
+            log_class_distribution('After balancing ', y)
+        return X, y
+
+    if verbose:
+        strategy = ', '.join(f'{cls}:{cnt}' for cls, cnt in under_strategy.items())
+        print(
+            f'   Applying mild undersampling: keep_fraction={majority_keep_fraction:.2f}, '
+            f'ratio={imbalance_ratio:.2f}, threshold={imbalance_threshold:.2f}'
+        )
+        print(f'   Undersample targets: {strategy}')
+
+    rus = RandomUnderSampler(sampling_strategy=under_strategy, random_state=seed)
+    X_balanced, y_balanced = rus.fit_resample(X, y)
+
+    if verbose:
+        log_class_distribution('After balancing ', y_balanced)
+
+    return X_balanced, y_balanced
+
+
 def balance_data(
     X,
     y,
@@ -162,24 +238,16 @@ def balance_data(
     majority_multiplier=8,
     min_majority_keep=50000,
 ):
-    """
-    Moderately balance data without collapsing large classes.
-
-    This function is intentionally conservative. The research pipeline now
-    prefers class weighting, and this sampler is kept for explicit hybrid
-    experiments only.
-    
-    Args:
-        X: Features
-        y: Labels
-        max_majority: Max samples per majority class
-        min_minority: Min samples per minority class
-        seed: Random seed
-        verbose: Print progress
-    
-    Returns:
-        (X_balanced, y_balanced)
-    """
+    """Backward-compatible wrapper around the conservative hybrid balancer."""
+    del max_majority, min_minority, majority_multiplier, min_majority_keep
+    return apply_hybrid_balancing(
+        X,
+        y,
+        imbalance_threshold=8.0,
+        majority_keep_fraction=majority_keep_fraction,
+        seed=seed,
+        verbose=verbose,
+    )
     counts = Counter(y)
     if verbose:
         log_class_distribution('Before balancing', y)
@@ -225,9 +293,71 @@ def balance_data(
     
     return X, y
 
+def compute_stable_class_weights(
+    y_encoded,
+    n_classes=None,
+    class_names=None,
+    clip_range=(1.0, 10.0),
+    normalize=True,
+    device=None,
+    verbose=True,
+):
+    """Compute clipped, normalized class weights and optionally return a tensor."""
+    y_encoded = np.asarray(y_encoded, dtype=np.int64)
+    if n_classes is None:
+        n_classes = int(y_encoded.max()) + 1 if y_encoded.size else 0
+
+    weights = np.ones(n_classes, dtype=np.float32)
+    present_classes = np.unique(y_encoded)
+    if present_classes.size:
+        present_weights = compute_class_weight(
+            class_weight='balanced',
+            classes=present_classes,
+            y=y_encoded,
+        ).astype(np.float32)
+        if clip_range is not None:
+            present_weights = np.clip(
+                present_weights,
+                clip_range[0],
+                clip_range[1],
+            )
+        weights[present_classes] = present_weights
+
+    if normalize and weights.size:
+        mean_weight = float(weights.mean())
+        if mean_weight > 0:
+            weights = weights / mean_weight
+
+    if verbose:
+        names = (
+            list(class_names)
+            if class_names is not None and len(class_names) == n_classes
+            else [str(i) for i in range(n_classes)]
+        )
+        summary = ', '.join(
+            f'{names[idx]}={weights[idx]:.4f}' for idx in range(n_classes)
+        )
+        print(
+            f'   Stable class weights'
+            f' (clip={clip_range}, normalized={normalize}): {summary}'
+        )
+
+    if device is not None:
+        return torch.tensor(weights, dtype=torch.float32, device=device)
+    return weights
+
 
 def compute_class_weight_vector(y_encoded, n_classes=None, class_names=None, verbose=True):
-    """Compute sklearn balanced class weights for encoded training labels."""
+    """Backward-compatible alias for stable class-weight computation."""
+    return compute_stable_class_weights(
+        y_encoded,
+        n_classes=n_classes,
+        class_names=class_names,
+        clip_range=(1.0, 10.0),
+        normalize=True,
+        device=None,
+        verbose=verbose,
+    )
     y_encoded = np.asarray(y_encoded, dtype=np.int64)
     if n_classes is None:
         n_classes = int(y_encoded.max()) + 1 if y_encoded.size else 0
@@ -257,13 +387,15 @@ def compute_class_weight_vector(y_encoded, n_classes=None, class_names=None, ver
 
 
 def make_class_weight_tensor(y_encoded, n_classes, device, class_names=None, verbose=True):
-    weights = compute_class_weight_vector(
+    return compute_stable_class_weights(
         y_encoded,
         n_classes=n_classes,
         class_names=class_names,
+        clip_range=(1.0, 10.0),
+        normalize=True,
+        device=device,
         verbose=verbose,
     )
-    return torch.tensor(weights, dtype=torch.float32, device=device)
 
 
 @dataclass
